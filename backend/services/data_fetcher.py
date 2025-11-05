@@ -1,30 +1,22 @@
-def get_stock_data(symbol: str):
+# backend/services/data_fetcher.py
+"""
+Data Fetcher — retrieves structured financial data like stock fundamentals or fund info.
+"""
+
+import random
+
+def get_financial_data(query: str):
     """
-    Placeholder stock data fetcher.
-    Later we’ll connect this to Yahoo Finance or Alpha Vantage API.
+    Mock structured data fetcher — replace with real API integration later.
     """
-    example_data = {
-        "price": 1234.56,
-        "change": "+2.15%",
+    fake_data = {
+        "symbol": query.upper(),
+        "current_price": round(random.uniform(100, 1500), 2),
+        "pe_ratio": round(random.uniform(5, 40), 2),
+        "market_cap": f"{round(random.uniform(1, 500), 2)}B",
         "sector": "Technology",
-        "market_cap": "1.2T",
-        "pe_ratio": 25.6,
-        "recommendation": "Buy"
+        "52_week_high": round(random.uniform(500, 2000), 2),
+        "52_week_low": round(random.uniform(50, 800), 2),
     }
-    return example_data
 
-
-def get_mutualfund_data(name: str):
-    """
-    Placeholder mutual fund data fetcher.
-    Later this will fetch data from AMFI, Value Research, or Groww APIs.
-    """
-    example_data = {
-        "NAV": 102.34,
-        "1Y_return": "12.5%",
-        "category": "Equity - Large Cap",
-        "fund_manager": "HDFC AMC",
-        "expense_ratio": "1.1%",
-        "recommendation": "Hold"
-    }
-    return example_data
+    return fake_data
