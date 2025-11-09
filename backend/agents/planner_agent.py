@@ -1,51 +1,127 @@
+# backend/agents/planner_agent.py
 """
-Planner Agent — decides what steps to take based on the user query using an LLM.
+Planner Agent — orchestrates multi-agent workflow for FinSage AI.
 """
 
-from backend.services.llm_service import generate_response
+from backend.services.llm_service import call_llm
+"""from backend.agents import (
+    data_agent,
+    document_agent,
+    calculation_agent,
+    reasoning_agent,
+)"""
+import asyncio
 
 
-def generate_plan(query: str) -> dict:
-    """
-    Generates a structured investment reasoning plan using an LLM.
-    Returns a dict with a clear sequence of reasoning steps.
-    """
+class PlannerAgent:
+    def __init__(self):
+        self.name = "Planner Agent"
 
-    prompt = f"""
-    You are a financial planning assistant helping to decide whether to invest in a financial instrument.
-    The user asked: "{query}"
+    async def handle_query(self, query: str) -> dict:
+        """
+        Main entry point for orchestrating agents.
+        """
+        try:
+            # Step 1: Understand query
+            intent = await self.analyze_intent(query)
+            print(f"Determined intent: {intent}")
 
-    Your goal:
-    - Think step-by-step.
-    - Identify what information is needed.
-    - Plan how to evaluate the opportunity.
-    - Return your plan as a structured JSON with keys: "objective", "steps", and "expected_outcome".
+            # Step 2: Determine agent flow
+            subtasks = self.plan_subtasks(intent)
+            print(f"Planned subtasks: {subtasks}")
 
-    Example output format:
-    {{
-        "objective": "Evaluate investment potential of HDFC Mutual Fund",
-        "steps": [
-            "Retrieve recent NAV trends and performance metrics",
-            "Analyze fund portfolio composition and top holdings",
-            "Compare against similar funds in the same category",
-            "Assess risk indicators such as volatility and beta",
-            "Summarize suitability based on investor risk appetite"
-        ],
-        "expected_outcome": "A summarized investment recommendation with risk-benefit analysis"
-    }}
+            # Step 3: Execute agents in order (or parallel)
+            results = await self.execute_agents(subtasks, query)
 
-    Now, generate the plan for the user query above.
-    """
+            # Step 4: Synthesize final response
+            final_answer = await self.synthesize_response(query, results)
 
-    response_text = generate_response(prompt)
+            return {"response": final_answer, "agents_used": list(results.keys())}
 
-    # The LLM might return plain text or JSON-like text
-    # Ensure it returns a clean dict
-    try:
-        import json
-        plan = json.loads(response_text)
-    except json.JSONDecodeError:
-        # Fallback if the model returned a non-JSON text
-        plan = {"objective": "Investment Plan", "steps": [response_text], "expected_outcome": "Plan generated in text form"}
+        except Exception as e:
+            return {"error": str(e)}
 
-    return plan
+    async def analyze_intent(self, query: str) -> str:
+        """
+        Uses LLM to analyze what the user wants.
+        """
+        prompt = f"""
+        Analyze this financial query and describe its intent in one short phrase.
+        Query: "{query}"
+        """
+        intent = await call_llm(prompt)
+        return intent.strip()
+
+    def plan_subtasks(self, intent: str):
+        """
+        Based on the intent, decide which agents to call.
+        """
+        subtasks = []
+
+        if "financial data" in intent or "price" in intent:
+            subtasks.append("data_agent")
+
+        if "document" in intent or "filing" in intent or "report" in intent:
+            subtasks.append("document_agent")
+
+        if "calculate" in intent or "ratio" in intent or "valuation" in intent:
+            subtasks.append("calculation_agent")
+
+        # Default: reasoning_agent for analysis
+        subtasks.append("reasoning_agent")
+
+        return subtasks
+
+    async def execute_agents(self, subtasks, query):
+        """
+        Executes selected agents asynchronously.
+        """
+        results = {}
+
+        async def run_agent(name):
+            if name == "data_agent":
+                print("Data Agent called")
+                results[name] = await data_agent.get_financial_data(query)
+                print(f"Data Agent result: {results[name]}")
+            elif name == "document_agent":
+                print("Document Agent called")
+                results[name] = await document_agent.extract_information(query)
+                print(f"Document Agent result: {results[name]}")
+            elif name == "calculation_agent":
+                print("Calculation Agent called")
+                results[name] = await calculation_agent.compute_metrics(query)
+                print(f"Calculation Agent result: {results[name]}")
+            elif name == "reasoning_agent":
+                print("Reasoning Agent called")
+                results[name] = await reasoning_agent.analyze_context(query, results)
+                print(f"Reasoning Agent result: {results[name]}")
+
+        await asyncio.gather(*(run_agent(t) for t in subtasks))
+        return results
+
+    async def synthesize_response(self, query, results):
+        """
+        Combines all agent outputs into a single LLM-generated summary.
+        """
+        context = "\n\n".join(
+            [f"{agent.upper()}:\n{data}" for agent, data in results.items()]
+        )
+        prompt = f"""
+        You are FinSage AI — a multi-agent financial assistant.
+        User Query: "{query}"
+
+        Use the following agent outputs to synthesize a professional, factual, and sourced response:
+
+        {context}
+
+        Make sure to include:
+        - Key insights
+        - Cited data points
+        - Summary conclusion
+        """
+        result= await call_llm(prompt)
+        print(f"Synthesized response: {result}")
+        return result
+
+
+planner_agent = PlannerAgent()

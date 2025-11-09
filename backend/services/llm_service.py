@@ -1,69 +1,46 @@
 """
-LLM Service — Handles all interactions with OpenAI (or any LLM API).
+LLM Service — connects FinSage AI to Groq’s free LLMs (e.g. Llama-3.1-70B).
 """
 
 import os
-import json
-from openai import OpenAI
+import aiohttp
 from dotenv import load_dotenv
 
-# Load environment variables from .env (if not already loaded)
 load_dotenv()
 
-# Get API key safely
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+DEFAULT_MODEL = "llama-3.1-8b-instant"
 
-if not OPENAI_API_KEY:
-    raise ValueError("❌ OPENAI_API_KEY not found in environment variables.")
-
-# Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+if not GROQ_API_KEY:
+    raise ValueError("Missing GROQ_API_KEY in .env file")
 
 
-def generate_response(prompt: str, model: str = "gpt-4o-mini", temperature: float = 0.5, max_tokens: int = 600) -> str:
+async def call_llm(prompt: str, model: str = None) -> str:
     """
-    Sends a prompt to the LLM and returns the model's text response.
-    This is used by agents (e.g., planner_agent) to reason and plan.
+    Calls Groq API asynchronously and returns the model's response text.
     """
+    model = model or DEFAULT_MODEL
 
-    try:
-        completion = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are a highly intelligent financial reasoning assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    data = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 800,
+    }
 
-        response_text = completion.choices[0].message.content.strip()
-        return response_text
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=data) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                raise Exception(f"Groq API error ({response.status}): {error_text}")
 
-    except Exception as e:
-        print(f"LLM Service Error: {e}")
-        return "Error: Failed to generate response from LLM."
-
-
-def generate_structured_json(prompt: str, model: str = "gpt-4o-mini", schema_description: str = "") -> dict:
-    """
-    Generates a structured JSON response from the LLM.
-    Useful when we want data in a specific schema.
-    """
-
-    structured_prompt = f"""
-    You are an assistant that outputs ONLY valid JSON (no explanations, no comments).
-    Schema description: {schema_description}
-    
-    Task:
-    {prompt}
-    """
-
-    response_text = generate_response(structured_prompt, model=model)
-
-    # Attempt to parse into JSON
-    try:
-        return json.loads(response_text)
-    except json.JSONDecodeError:
-        # Handle partial or malformed JSON
-        return {"raw_output": response_text, "error": "Could not parse LLM output as JSON."}
+            res = await response.json()
+            try:
+                return res["choices"][0]["message"]["content"]
+            except Exception as e:
+                raise Exception(f"Invalid response format: {res}") from e

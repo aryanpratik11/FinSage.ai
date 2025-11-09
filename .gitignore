@@ -9,7 +9,7 @@ __pycache__/
 
 # Virtual environment folders
 venv/
-env/
+.env
 .venv/
 
 # OS and editor files
@@ -23,3 +23,5 @@ Thumbs.db
 data/*.pdf
 data/*.txt
 results/
+".env" 
+".env" 
