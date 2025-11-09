@@ -15,7 +15,7 @@ if not GROQ_API_KEY:
     raise ValueError("Missing GROQ_API_KEY in .env file")
 
 
-async def call_llm(prompt: str, model: str = None) -> str:
+async def call_llm(prompt: str, model: str = None, temperature: float = 0.3, max_tokens: int = 800) -> str:
     """
     Calls Groq API asynchronously and returns the model's response text.
     """
@@ -29,8 +29,8 @@ async def call_llm(prompt: str, model: str = None) -> str:
     data = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "max_tokens": 800,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
     }
 
     async with aiohttp.ClientSession() as session:
@@ -42,5 +42,5 @@ async def call_llm(prompt: str, model: str = None) -> str:
             res = await response.json()
             try:
                 return res["choices"][0]["message"]["content"]
-            except Exception as e:
-                raise Exception(f"Invalid response format: {res}") from e
+            except Exception:
+                raise Exception(f"Invalid response format: {res}")
