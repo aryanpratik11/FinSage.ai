@@ -5,10 +5,6 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime
 from backend.services.llm_service import call_llm
 from backend.models.chat_models import AgentStep
-<<<<<<< HEAD
-
-=======
->>>>>>> 9a017a7 (Planner agent updated)
 # Import agents as they become available
 # from backend.agents.data_agent import data_agent
 # from backend.agents.news_agent import news_agent
@@ -22,22 +18,6 @@ from backend.models.chat_models import AgentStep
 
 
 class PlannerAgent:
-<<<<<<< HEAD
-    """
-    Central orchestrator for FinSage AI multi-agent system.
-    
-    Responsibilities:
-    1. Analyze user intent
-    2. Create dynamic execution plan
-    3. Orchestrate agent execution (parallel when possible)
-    4. Validate results
-    5. Synthesize final response
-    """
-    
-    # Available agents registry
-=======
-
->>>>>>> 9a017a7 (Planner agent updated)
     AVAILABLE_AGENTS = [
         "data_agent",
         "news_agent", 
@@ -50,10 +30,6 @@ class PlannerAgent:
         "validation_agent"
     ]
     
-<<<<<<< HEAD
-    # Agent execution priority (lower = higher priority)
-=======
->>>>>>> 9a017a7 (Planner agent updated)
     AGENT_PRIORITY = {
         "document_agent": 1,  # Get documents first
         "data_agent": 2,      # Then fetch data
@@ -76,18 +52,9 @@ class PlannerAgent:
         context: Optional[List[Dict[str, str]]] = None
     ) -> Dict[str, Any]:
         """
-<<<<<<< HEAD
-        Central orchestrator — plans, executes, and synthesizes agent outputs.
-        
         Args:
             query: User's financial query
             context: Conversation history (optional)
-            
-=======
-        Args:
-            query: User's financial query
-            context: Conversation history (optional)
->>>>>>> 9a017a7 (Planner agent updated)
         Returns:
             Dictionary containing:
                 - response: Final synthesized answer
@@ -103,23 +70,6 @@ class PlannerAgent:
         try:
             self._log_step("planner", "Query received", f"Processing: {query[:100]}...")
             
-<<<<<<< HEAD
-            # Step 1: Intent analysis
-            intent = await self.analyze_intent(query, context)
-            self._log_step("planner", "Intent analysis", f"Detected: {intent}")
-            
-            # Step 2: Dynamic task planning
-            subtasks = await self.dynamic_plan(intent, query, context)
-            self._log_step("planner", "Task planning", f"Planned: {', '.join(subtasks)}")
-            
-            # Step 3: Validate plan
-            subtasks = self._validate_and_prioritize_plan(subtasks)
-            
-            # Step 4: Execute agents in optimized order
-            results = await self.execute_agents(subtasks, query, context)
-            
-            # Step 5: Always run validation agent if available
-=======
             intent = await self.analyze_intent(query, context)
             self._log_step("planner", "Intent analysis", f"Detected: {intent}")
             
@@ -130,25 +80,14 @@ class PlannerAgent:
             
             results = await self.execute_agents(subtasks, query, context)
             
->>>>>>> 9a017a7 (Planner agent updated)
             if "validation_agent" not in subtasks:
                 self._log_step("validation", "Final validation", "Verifying results...")
                 # results["validation_agent"] = await self._run_validation(results)
             
-<<<<<<< HEAD
-            # Step 6: Calculate confidence based on results
-            confidence = self._calculate_confidence(results)
-            
-            # Step 7: Extract sources
-            sources = self._extract_sources(results)
-            
-            # Step 8: Final synthesis
-=======
             confidence = self._calculate_confidence(results)
             
             sources = self._extract_sources(results)
             
->>>>>>> 9a017a7 (Planner agent updated)
             final_answer = await self.synthesize_response(query, results, intent)
             self._log_step("planner", "Response synthesis", "Complete")
             
@@ -180,17 +119,8 @@ class PlannerAgent:
         context: Optional[List[Dict[str, str]]] = None
     ) -> str:
         """
-<<<<<<< HEAD
-        Uses LLM to classify the financial query intent.
-        
         Args:
             query: User query
-            context: Previous conversation (optional)
-            
-=======
-        Args:
-            query: User query
->>>>>>> 9a017a7 (Planner agent updated)
         Returns:
             Intent classification string
         """
@@ -250,19 +180,9 @@ Now analyze the query above:"""
         context: Optional[List[Dict[str, str]]] = None
     ) -> List[str]:
         """
-<<<<<<< HEAD
-        Dynamically determines which agents to invoke based on intent and query.
-        
         Args:
             intent: Detected intent
             query: User query
-            context: Conversation context
-            
-=======
-        Args:
-            intent: Detected intent
-            query: User query
->>>>>>> 9a017a7 (Planner agent updated)
         Returns:
             Ordered list of agent names to execute
         """
@@ -328,11 +248,6 @@ Now plan for the query above. Return ONLY the JSON array:"""
     
     def _parse_agent_list(self, response: str) -> List[str]:
         """
-<<<<<<< HEAD
-        Parse agent list from LLM response (handles JSON or text).
-        
-=======
->>>>>>> 9a017a7 (Planner agent updated)
         Args:
             response: LLM response text
             
@@ -353,11 +268,6 @@ Now plan for the query above. Return ONLY the JSON array:"""
     
     def _validate_and_prioritize_plan(self, subtasks: List[str]) -> List[str]:
         """
-<<<<<<< HEAD
-        Validate plan and sort agents by execution priority.
-        
-=======
->>>>>>> 9a017a7 (Planner agent updated)
         Args:
             subtasks: List of agent names
             
@@ -390,30 +300,14 @@ Now plan for the query above. Return ONLY the JSON array:"""
         context: Optional[List[Dict[str, str]]] = None
     ) -> Dict[str, Any]:
         """
-<<<<<<< HEAD
-        Executes selected agents with optimized parallelization.
-        
-        Agents at the same priority level run in parallel.
-        
         Args:
             subtasks: List of agent names to execute
             query: User query
-            context: Conversation context
-            
-=======
-        Args:
-            subtasks: List of agent names to execute
-            query: User query
->>>>>>> 9a017a7 (Planner agent updated)
         Returns:
             Dictionary of agent results
         """
         results = {}
         
-<<<<<<< HEAD
-        # Group agents by priority for parallel execution
-=======
->>>>>>> 9a017a7 (Planner agent updated)
         priority_groups = {}
         for agent in subtasks:
             priority = self.AGENT_PRIORITY.get(agent, 999)
