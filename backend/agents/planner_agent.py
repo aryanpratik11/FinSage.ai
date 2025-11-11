@@ -6,8 +6,8 @@ from datetime import datetime
 from backend.services.llm_service import call_llm
 from backend.models.chat_models import AgentStep
 # Import agents as they become available
-# from backend.agents.data_agent import data_agent
-# from backend.agents.news_agent import news_agent
+from backend.agents.data_agent import data_agent
+from backend.agents.news_agent import news_agent
 # from backend.agents.prediction_agent import prediction_agent
 # from backend.agents.reasoning_agent import reasoning_agent
 # from backend.agents.document_agent import document_agent
@@ -54,50 +54,53 @@ class PlannerAgent:
         """
         Args:
             query: User's financial query
-            context: Conversation history (optional)
         Returns:
             Dictionary containing:
+                - company: Detected company/entity name (if any)
+                - intent: Detected query intent
                 - response: Final synthesized answer
                 - confidence: Confidence score (0-1)
                 - sources: List of data sources used
                 - agent_steps: Execution log
                 - agents_used: List of agent names invoked
-                - intent: Detected query intent
         """
         self.execution_log = []
         start_time = datetime.utcnow()
-        
+    
         try:
+            print(f"Planner Agent: Query received - {query}")
             self._log_step("planner", "Query received", f"Processing: {query[:100]}...")
-            
-            intent = await self.analyze_intent(query, context)
-            self._log_step("planner", "Intent analysis", f"Detected: {intent}")
-            
-            subtasks = await self.dynamic_plan(intent, query, context)
-            self._log_step("planner", "Task planning", f"Planned: {', '.join(subtasks)}")
-            
+
+            analysis = await self.analyze_and_plan(query, context)
+            company = analysis.get("company")
+            intent = analysis.get("intent")
+            subtasks = analysis.get("agents", [])
+            self._log_step("planner", "Analysis and Planning", 
+                       f"Detected company: {company or 'None'}, Intent: {intent}, Agents: {', '.join(subtasks)}")
+            print(f"Planner Agent: Analysis complete - Company: {company}, Intent: {intent}, Agents: {subtasks}")
             subtasks = self._validate_and_prioritize_plan(subtasks)
-            
-            results = await self.execute_agents(subtasks, query, context)
-            
+            results = await self.execute_agents(subtasks, query, context, company)
+
             if "validation_agent" not in subtasks:
                 self._log_step("validation", "Final validation", "Verifying results...")
                 # results["validation_agent"] = await self._run_validation(results)
-            
+
             confidence = self._calculate_confidence(results)
-            
             sources = self._extract_sources(results)
-            
+
             final_answer = await self.synthesize_response(query, results, intent)
             self._log_step("planner", "Response synthesis", "Complete")
-            
+            print("Planner Agent: Response synthesis complete.")
+            print(f"Response: {final_answer}, Company: {company}, Intent: {intent}, Confidence: {confidence}, Sources: {sources}, Agents Used: {list(results.keys())}, Agents Steps: {self.execution_log}")
+
             return {
                 "response": final_answer,
+                "company": company,
+                "intent": intent,
                 "confidence": confidence,
                 "sources": sources,
                 "agent_steps": self.execution_log,
                 "agents_used": list(results.keys()),
-                "intent": intent,
                 "processing_time_ms": (datetime.utcnow() - start_time).total_seconds() * 1000
             }
             
@@ -110,152 +113,74 @@ class PlannerAgent:
                 "agent_steps": self.execution_log,
                 "agents_used": [],
                 "intent": "error",
+                "company": None,
                 "error": str(e)
             }
-    
-    async def analyze_intent(
-        self, 
-        query: str, 
-        context: Optional[List[Dict[str, str]]] = None
-    ) -> str:
+
+    async def analyze_and_plan(self, query: str, context: Optional[List[Dict[str, str]]] = None):
+        prompt = f"""
+        You are FinSage's Planner AI.
+
+        Analyze this financial query and return a JSON object with:
+        - company: Main company or entity name(s) (or None)
+        - intent: One of the predefined intent categories
+        - agents: List of agents to invoke (see below)
+
+        Available agents:
+        data_agent, news_agent, prediction_agent, reasoning_agent,
+        document_agent, calculation_agent, comparison_agent,
+        risk_agent, validation_agent
+
+        Query: "{query}"
+
+        {f'Context:\n{context[-3:]}' if context else ''}
+
+        Return JSON only, no text.
+
+        Example output:
+        {{
+            "company": "Tesla (TSLA)",
+            "intent": "Investment recommendation",
+            "agents": ["data_agent", "news_agent", "risk_agent", "reasoning_agent"]
+        }}
         """
-        Args:
-            query: User query
-        Returns:
-            Intent classification string
-        """
-        context_text = ""
-        if context:
-            recent = context[-3:]  # Last 3 messages
-            context_text = "\n".join([f"{m['role']}: {m['content']}" for m in recent])
-        
-        prompt = f"""You are the FinSage Intent Analyzer.
 
-Analyze this financial query and classify its primary intent in ONE precise phrase.
+        response = await call_llm(prompt, max_tokens=250)
 
-Query: "{query}"
-
-{f'Recent Conversation Context:\n{context_text}\n' if context_text else ''}
-
-Intent Categories:
-- Stock price inquiry
-- Investment recommendation
-- Company analysis
-- Market prediction
-- Financial document retrieval
-- Portfolio comparison
-- Risk assessment
-- News and sentiment analysis
-- Financial calculation
-- General financial advice
-
-Return ONLY the intent phrase, nothing else.
-
-Examples:
-Query: "What is Tesla's stock price?"
-Intent: Stock price inquiry
-
-Query: "Should I invest in Apple?"
-Intent: Investment recommendation
-
-Query: "Compare AAPL and MSFT"
-Intent: Portfolio comparison
-
-Query: "Show me Tesla's latest 10-K"
-Intent: Financial document retrieval
-
-Now analyze the query above:"""
-        
+        # --- Safe JSON parsing ---
         try:
-            intent = await call_llm(prompt, max_tokens=50)
-            return intent.strip()
-        except Exception as e:
-            self._log_step("planner", "Intent analysis failed", str(e))
-            return "general_query"
-    
-    async def dynamic_plan(
-        self, 
-        intent: str, 
-        query: str,
-        context: Optional[List[Dict[str, str]]] = None
-    ) -> List[str]:
-        """
-        Args:
-            intent: Detected intent
-            query: User query
-        Returns:
-            Ordered list of agent names to execute
-        """
-        planning_prompt = f"""You are the FinSage Task Planner.
+            result = json.loads(response)
+        except json.JSONDecodeError:
+            # Try to extract JSON substring if LLM wrapped it in text
+            match = re.search(r'\{.*\}', response, re.DOTALL)
+            if match:
+                try:
+                    result = json.loads(match.group())
+                except Exception:
+                    result = None
+            else:
+                result = None
 
-Based on the user's query and intent, determine which specialized agents should be invoked.
+        # --- Fallback plan if JSON still invalid ---
+        if not result or not isinstance(result, dict):
+            self._log_step("planner", "LLM output invalid", f"Raw output: {response}")
+            result = {
+                "company": None,
+                "intent": "general_financial_query",
+                "agents": ["data_agent", "news_agent", "reasoning_agent"]
+            }
 
-Available Agents:
-- data_agent: Fetches real-time stock prices, market data, company fundamentals
-- news_agent: Retrieves latest financial news and sentiment
-- prediction_agent: Makes forecasts and predictions
-- reasoning_agent: Analyzes data and provides insights
-- document_agent: Retrieves SEC filings, reports, documents
-- calculation_agent: Performs financial calculations (P/E, DCF, ratios)
-- comparison_agent: Compares multiple stocks/companies
-- risk_agent: Assesses investment risks
-- validation_agent: Validates outputs for accuracy
+        return result
 
-User Intent: "{intent}"
-User Query: "{query}"
 
-Instructions:
-1. Select ONLY the agents needed (don't invoke all unnecessarily)
-2. Return as a JSON array of agent names
-3. Order agents logically (e.g., get data before calculating)
-4. Always include reasoning_agent for synthesis
-
-Examples:
-
-Query: "What is AAPL stock price?"
-Response: ["data_agent", "reasoning_agent"]
-
-Query: "Should I invest in Tesla? Compare with Ford."
-Response: ["data_agent", "news_agent", "comparison_agent", "risk_agent", "reasoning_agent"]
-
-Query: "Show me Microsoft's latest 10-K and calculate their P/E"
-Response: ["document_agent", "data_agent", "calculation_agent", "reasoning_agent"]
-
-Query: "Predict next week's NIFTY trend"
-Response: ["data_agent", "news_agent", "prediction_agent", "reasoning_agent"]
-
-Now plan for the query above. Return ONLY the JSON array:"""
-        
-        try:
-            response = await call_llm(planning_prompt, max_tokens=200)
-            
-            # Parse JSON response
-            agents = self._parse_agent_list(response)
-            
-            # Ensure reasoning_agent is always included
-            if "reasoning_agent" not in agents:
-                agents.append("reasoning_agent")
-            
-            # Filter to only available agents
-            agents = [a for a in agents if a in self.AVAILABLE_AGENTS]
-            
-            return agents if agents else ["reasoning_agent"]
-            
-        except Exception as e:
-            self._log_step("planner", "Planning failed, using fallback", str(e))
-            # Fallback to basic agents
-            return ["data_agent", "reasoning_agent"]
-    
     def _parse_agent_list(self, response: str) -> List[str]:
         """
         Args:
             response: LLM response text
-            
         Returns:
             List of agent names
         """
         try:
-            # Try parsing as JSON
             agents = json.loads(response)
             if isinstance(agents, list):
                 return agents
@@ -270,11 +195,9 @@ Now plan for the query above. Return ONLY the JSON array:"""
         """
         Args:
             subtasks: List of agent names
-            
         Returns:
             Prioritized list of valid agents
         """
-        # Remove duplicates while preserving order
         seen = set()
         unique = []
         for task in subtasks:
@@ -297,7 +220,8 @@ Now plan for the query above. Return ONLY the JSON array:"""
         self, 
         subtasks: List[str], 
         query: str,
-        context: Optional[List[Dict[str, str]]] = None
+        context: Optional[List[Dict[str, str]]] = None,
+        company: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Args:
@@ -315,12 +239,10 @@ Now plan for the query above. Return ONLY the JSON array:"""
                 priority_groups[priority] = []
             priority_groups[priority].append(agent)
         
-        # Execute each priority group sequentially, agents within group in parallel
         for priority in sorted(priority_groups.keys()):
             agents_in_group = priority_groups[priority]
             
-            # Run all agents in this priority group in parallel
-            tasks = [self._run_agent(agent, query, results, context) for agent in agents_in_group]
+            tasks = [self._run_agent(agent, query, results, context, company) for agent in agents_in_group]
             group_results = await asyncio.gather(*tasks, return_exceptions=True)
             
             # Merge results
@@ -338,7 +260,8 @@ Now plan for the query above. Return ONLY the JSON array:"""
         agent_name: str, 
         query: str, 
         previous_results: Dict[str, Any],
-        context: Optional[List[Dict[str, str]]] = None
+        context: Optional[List[Dict[str, str]]] = None,
+        company: Optional[str] = None
     ) -> Any:
         """
         Run a single agent and log execution.
@@ -359,12 +282,12 @@ Now plan for the query above. Return ONLY the JSON array:"""
             # For now, return mock data
             
             if agent_name == "data_agent":
-                # result = await data_agent.get_financial_data(query)
-                result = {"mock": "data_agent not implemented yet"}
+                print(f"Planner Agent: Running data_agent for query: {company or query}")
+                result = await data_agent.get_financial_data(company or query)
                 
             elif agent_name == "news_agent":
-                # result = await news_agent.get_latest_news(query)
-                result = {"mock": "news_agent not implemented yet"}
+                print(f"Planner Agent: Running news_agent for query: {company or query}")
+                result = await news_agent.get_company_news(company or query)
                 
             elif agent_name == "prediction_agent":
                 # result = await prediction_agent.forecast_trends(query, previous_results)
@@ -555,5 +478,4 @@ Please try:
 I'm here to help with financial analysis, stock information, market insights, and investment guidance."""
 
 
-# Create singleton instance
 planner_agent = PlannerAgent()
