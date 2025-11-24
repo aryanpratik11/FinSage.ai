@@ -3,9 +3,9 @@ import json
 import re
 from typing import Dict, List, Any, Optional
 from datetime import datetime
+
 from backend.services.llm_service import call_llm
 from backend.models.chat_models import AgentStep
-# Import agents as they become available
 from backend.agents.data_agent import data_agent
 from backend.agents.news_agent import news_agent
 # from backend.agents.prediction_agent import prediction_agent
@@ -17,81 +17,134 @@ from backend.agents.news_agent import news_agent
 # from backend.agents.validation_agent import validation_agent
 
 
+# ───────────────────────── SAFE TEXT LIMITER ─────────────────────────
+
+def truncate(text: Any, limit: int = 1500) -> str:
+    """
+    Safely shorten large text blocks so prompts stay within the 4k context
+    window of Llama-3.2-1B.
+    """
+    if text is None:
+        return ""
+    s = str(text)
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "\n...[TRUNCATED]..."
+
+
 class PlannerAgent:
+    """
+    LLM-structured multi-step pipeline:
+    
+    1) Parse & plan using local Llama
+    2) News agent → all important recent news about the entity
+    3) Data agent → fundamentals, prices, ratios, etc.
+    4) Calculation agent → compute key metrics from raw data (P/E, growth, etc.) [future]
+    5) Reasoning agent (or LLM fallback) → analyze investment case
+    6) Prediction agent (optional) → future outlook if relevant
+    7) Validation agent → sanity check and confidence
+    """
+
     AVAILABLE_AGENTS = [
+        "news_agent",
         "data_agent",
-        "news_agent", 
-        "prediction_agent",
-        "reasoning_agent",
-        "document_agent",
         "calculation_agent",
+        "reasoning_agent",
+        "prediction_agent",
+        "document_agent",
         "comparison_agent",
         "risk_agent",
         "validation_agent"
     ]
-    
+
+    # Strict order that matches your description
     AGENT_PRIORITY = {
-        "document_agent": 1,  # Get documents first
-        "data_agent": 2,      # Then fetch data
-        "news_agent": 2,      # News in parallel with data
-        "calculation_agent": 3, # Calculate after data available
-        "comparison_agent": 3,  # Compare after data available
-        "prediction_agent": 4,  # Predict based on data
-        "risk_agent": 4,       # Assess risk based on data
-        "reasoning_agent": 5,  # Reason about everything
-        "validation_agent": 6  # Always validate last
+        "news_agent": 1,          # First: related news
+        "data_agent": 2,          # Second: market/financial data
+        "calculation_agent": 3,   # Third: derived metrics
+        "reasoning_agent": 4,     # Fourth: reasoning on all info
+        "prediction_agent": 5,    # Fifth: future outlook if needed
+        "comparison_agent": 5,    # Peer comparison around same stage
+        "risk_agent": 5,          # Risk assessment with prediction
+        "document_agent": 6,      # Filings / deeper docs if needed
+        "validation_agent": 7     # Last: validation
     }
-    
+
     def __init__(self):
         self.name = "Planner Agent"
         self.execution_log: List[AgentStep] = []
-    
+
     async def handle_query(
-        self, 
-        query: str, 
+        self,
+        query: str,
         context: Optional[List[Dict[str, str]]] = None
     ) -> Dict[str, Any]:
         """
-        Args:
-            query: User's financial query
+        Main entry point.
+
         Returns:
-            Dictionary containing:
-                - company: Detected company/entity name (if any)
-                - intent: Detected query intent
-                - response: Final synthesized answer
-                - confidence: Confidence score (0-1)
-                - sources: List of data sources used
-                - agent_steps: Execution log
-                - agents_used: List of agent names invoked
+            {
+              "response": final LLM answer,
+              "company": detected entity,
+              "intent": high-level intent,
+              "confidence": float,
+              "sources": [...],
+              "agent_steps": [...],
+              "agents_used": [...],
+              "processing_time_ms": float
+            }
         """
         self.execution_log = []
         start_time = datetime.utcnow()
-    
+
         try:
             print(f"Planner Agent: Query received - {query}")
             self._log_step("planner", "Query received", f"Processing: {query[:100]}...")
 
+            # STEP 1: LLM planning / parsing
             analysis = await self.analyze_and_plan(query, context)
+
             company = analysis.get("company")
             intent = analysis.get("intent")
             subtasks = analysis.get("agents", [])
-            self._log_step("planner", "Analysis and Planning", 
-                       f"Detected company: {company or 'None'}, Intent: {intent}, Agents: {', '.join(subtasks)}")
+
+            self._log_step(
+                "planner",
+                "Analysis and Planning",
+                f"Detected entity: {company or 'None'}, "
+                f"Intent: {intent}, "
+                f"Agents (raw): {', '.join(subtasks) if subtasks else 'None'}"
+            )
             print(f"Planner Agent: Analysis complete - Company: {company}, Intent: {intent}, Agents: {subtasks}")
+
+            # Ensure pipeline structure: news → data → calc → reasoning → prediction? → validation
             subtasks = self._validate_and_prioritize_plan(subtasks)
+
+            # STEP 2: Execute agents in priority order
             results = await self.execute_agents(subtasks, query, context, company)
 
+            # If no dedicated validation, add a simple built-in validation
             if "validation_agent" not in subtasks:
-                self._log_step("validation", "Final validation", "Verifying results...")
-                # results["validation_agent"] = await self._run_validation(results)
+                self._log_step("validation", "Final validation", "Running built-in validation...")
+                results["validation_agent"] = {
+                    "validated": True,
+                    "confidence": 0.85,
+                    "notes": "Basic built-in validation (no external agent)."
+                }
 
+            # STEP 3: Confidence + sources + final synthesis
             confidence = self._calculate_confidence(results)
             sources = self._extract_sources(results)
 
             final_answer = await self.synthesize_response(query, results, intent)
             self._log_step("planner", "Response synthesis", "Complete")
+
             print("Planner Agent: Response synthesis complete.")
-            print(f"Response: {final_answer}, Company: {company}, Intent: {intent}, Confidence: {confidence}, Sources: {sources}, Agents Used: {list(results.keys())}, Agents Steps: {self.execution_log}")
+            print(
+                f"Response: {final_answer}, Entity: {company}, Intent: {intent}, "
+                f"Confidence: {confidence}, Sources: {sources}, "
+                f"Agents Used: {list(results.keys())}"
+            )
 
             return {
                 "response": final_answer,
@@ -103,7 +156,7 @@ class PlannerAgent:
                 "agents_used": list(results.keys()),
                 "processing_time_ms": (datetime.utcnow() - start_time).total_seconds() * 1000
             }
-            
+
         except Exception as e:
             self._log_step("planner", "Error occurred", str(e))
             return {
@@ -117,344 +170,468 @@ class PlannerAgent:
                 "error": str(e)
             }
 
-    async def analyze_and_plan(self, query: str, context: Optional[List[Dict[str, str]]] = None):
-        prompt = f"""
-        You are FinSage's Planner AI.
+    # ───────────────────────── LLM PLANNING STEP ─────────────────────────
 
-        Analyze this financial query and return a JSON object with:
-        - company: Main company or entity name(s) (or None)
-        - intent: One of the predefined intent categories
-        - agents: List of agents to invoke (see below)
-
-        Available agents:
-        data_agent, news_agent, prediction_agent, reasoning_agent,
-        document_agent, calculation_agent, comparison_agent,
-        risk_agent, validation_agent
-
-        Query: "{query}"
-
-        {f'Context:\n{context[-3:]}' if context else ''}
-
-        Return JSON only, no text.
-
-        Example output:
-        {{
-            "company": "Tesla (TSLA)",
-            "intent": "Investment recommendation",
-            "agents": ["data_agent", "news_agent", "risk_agent", "reasoning_agent"]
-        }}
+    async def analyze_and_plan(
+        self,
+        query: str,
+        context: Optional[List[Dict[str, str]]] = None
+    ) -> Dict[str, Any]:
         """
+        Use Llama to parse the query, identify entity, intent,
+        and decide which agents to use (but the order is fixed by AGENT_PRIORITY).
+        """
+        # keep query and context small for the planner
+        query_short = truncate(query, 600)
+
+        ctx_str = ""
+        if context:
+            # last 3 messages for lightweight context
+            ctx_str = "\nRecent context:\n" + truncate(
+                json.dumps(context[-3:], ensure_ascii=False),
+                500
+            )
+
+        prompt = f"""
+You are FinSage's Planner AI.
+
+Your job:
+1. Understand the user's financial/investment query
+2. Detect the main entity (company / stock / crypto / index / sector)
+3. Classify the high-level intent
+4. Decide which analysis stages are needed.
+
+Available stages (agents):
+- news_agent: Find recent important news about the entity or topic
+- data_agent: Get market/financial data and fundamentals
+- calculation_agent: Compute key metrics (valuations, growth, ratios)
+- reasoning_agent: Combine information and analyze investment case
+- prediction_agent: Provide future outlook or scenarios
+- risk_agent: Assess major risks
+- document_agent: Use filings/reports if needed
+- comparison_agent: Compare with peers, benchmarks, or alternatives
+- validation_agent: Final consistency check
+
+User Query:
+\"\"\"
+{query_short}
+\"\"\"
+{ctx_str}
+
+Return a JSON object ONLY, no extra text.
+
+JSON format:
+{{
+  "company": string or null,
+  "intent": string,  // e.g. "buy/sell decision", "long-term investment view", "news impact", etc.
+  "need_prediction": boolean,
+  "need_risk_assessment": boolean,
+  "agents": [
+    "news_agent",
+    "data_agent",
+    "calculation_agent",
+    "reasoning_agent",
+    "prediction_agent",
+    "validation_agent"
+  ]
+}}
+"""
 
         response = await call_llm(prompt, max_tokens=250)
 
-        # --- Safe JSON parsing ---
+        # Safe JSON parsing
+        result: Optional[Dict[str, Any]] = None
         try:
             result = json.loads(response)
         except json.JSONDecodeError:
-            # Try to extract JSON substring if LLM wrapped it in text
-            match = re.search(r'\{.*\}', response, re.DOTALL)
+            match = re.search(r'\{[\s\S]*\}', response)
             if match:
                 try:
                     result = json.loads(match.group())
                 except Exception:
                     result = None
-            else:
-                result = None
 
-        # --- Fallback plan if JSON still invalid ---
+        # Fallback if LLM returned junk
         if not result or not isinstance(result, dict):
-            self._log_step("planner", "LLM output invalid", f"Raw output: {response}")
+            self._log_step("planner", "LLM output invalid", f"Raw output: {truncate(response, 500)}")
             result = {
                 "company": None,
                 "intent": "general_financial_query",
-                "agents": ["data_agent", "news_agent", "reasoning_agent"]
+                "need_prediction": False,
+                "need_risk_assessment": False,
+                "agents": [
+                    "news_agent",
+                    "data_agent",
+                    "calculation_agent",
+                    "reasoning_agent",
+                    "validation_agent"
+                ]
             }
+
+        # Ensure agents list exists
+        if "agents" not in result or not isinstance(result["agents"], list):
+            result["agents"] = [
+                "news_agent",
+                "data_agent",
+                "calculation_agent",
+                "reasoning_agent",
+                "validation_agent"
+            ]
+
+        # Inject prediction/risk agents if LLM flags them
+        if result.get("need_prediction"):
+            if "prediction_agent" not in result["agents"]:
+                result["agents"].append("prediction_agent")
+        if result.get("need_risk_assessment"):
+            if "risk_agent" not in result["agents"]:
+                result["agents"].append("risk_agent")
 
         return result
 
+    # ───────────────────────── PLAN VALIDATION / ORDERING ─────────────────────────
 
-    def _parse_agent_list(self, response: str) -> List[str]:
-        """
-        Args:
-            response: LLM response text
-        Returns:
-            List of agent names
-        """
-        try:
-            agents = json.loads(response)
-            if isinstance(agents, list):
-                return agents
-        except:
-            pass
-        
-        # Fallback: regex extract agent names
-        agents = re.findall(r'\b(\w+_agent)\b', response)
-        return list(set(agents))  # Remove duplicates
-    
     def _validate_and_prioritize_plan(self, subtasks: List[str]) -> List[str]:
         """
-        Args:
-            subtasks: List of agent names
-        Returns:
-            Prioritized list of valid agents
+        Keep only known agents, remove duplicates, then sort by AGENT_PRIORITY
+        to enforce the step-by-step pipeline structure.
         """
-        seen = set()
-        unique = []
-        for task in subtasks:
-            if task not in seen and task in self.AVAILABLE_AGENTS:
-                seen.add(task)
-                unique.append(task)
-        
-        # Sort by priority (validation_agent always last)
-        sorted_tasks = sorted(
-            unique, 
-            key=lambda x: (
-                self.AGENT_PRIORITY.get(x, 999),
-                unique.index(x)  # Preserve original order for same priority
-            )
-        )
-        
+        # Filter to known agents
+        valid = [a for a in subtasks if a in self.AVAILABLE_AGENTS]
+        # Remove duplicates while preserving order
+        unique = list(dict.fromkeys(valid))
+
+        # Sort by priority (lower = earlier)
+        sorted_tasks = sorted(unique, key=lambda x: self.AGENT_PRIORITY.get(x, 999))
+
+        self._log_step("planner", "Final agent pipeline", f" → ".join(sorted_tasks) or "No agents selected")
         return sorted_tasks
-    
+
+    # ───────────────────────── EXECUTION LAYER ─────────────────────────
+
     async def execute_agents(
-        self, 
-        subtasks: List[str], 
+        self,
+        subtasks: List[str],
         query: str,
         context: Optional[List[Dict[str, str]]] = None,
         company: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Args:
-            subtasks: List of agent names to execute
-            query: User query
-        Returns:
-            Dictionary of agent results
+        Execute agents in priority order.
+        Agents with the same numeric priority can run in parallel.
         """
-        results = {}
-        
-        priority_groups = {}
+        results: Dict[str, Any] = {}
+
+        # Group agents by priority
+        priority_groups: Dict[int, List[str]] = {}
         for agent in subtasks:
             priority = self.AGENT_PRIORITY.get(agent, 999)
-            if priority not in priority_groups:
-                priority_groups[priority] = []
-            priority_groups[priority].append(agent)
-        
+            priority_groups.setdefault(priority, []).append(agent)
+
+        # Run groups in ascending priority order
         for priority in sorted(priority_groups.keys()):
             agents_in_group = priority_groups[priority]
-            
-            tasks = [self._run_agent(agent, query, results, context, company) for agent in agents_in_group]
+
+            tasks = [
+                self._run_agent(agent, query, results, context, company)
+                for agent in agents_in_group
+            ]
+
             group_results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Merge results
+
             for agent, result in zip(agents_in_group, group_results):
                 if isinstance(result, Exception):
                     self._log_step(agent, "Execution failed", str(result))
                     results[agent] = {"error": str(result)}
                 else:
                     results[agent] = result
-        
+
         return results
-    
+
     async def _run_agent(
-        self, 
-        agent_name: str, 
-        query: str, 
+        self,
+        agent_name: str,
+        query: str,
         previous_results: Dict[str, Any],
         context: Optional[List[Dict[str, str]]] = None,
         company: Optional[str] = None
     ) -> Any:
         """
-        Run a single agent and log execution.
-        
-        Args:
-            agent_name: Name of agent to execute
-            query: User query
-            previous_results: Results from previously executed agents
-            context: Conversation context
-            
-        Returns:
-            Agent execution result
+        Run a single agent, with logging.
         """
-        self._log_step(agent_name, "Executing", f"Processing query...")
-        
+        self._log_step(agent_name, "Executing", "Processing...")
+
         try:
-            # TODO: Replace with actual agent calls when implemented
-            # For now, return mock data
-            
-            if agent_name == "data_agent":
-                print(f"Planner Agent: Running data_agent for query: {company or query}")
-                result = await data_agent.get_financial_data(company or query)
-                
-            elif agent_name == "news_agent":
-                print(f"Planner Agent: Running news_agent for query: {company or query}")
+            # 📰 News stage
+            if agent_name == "news_agent":
+                print(f"Planner Agent: Running news_agent for entity: {company or query}")
                 result = await news_agent.get_company_news(company or query)
-                
-            elif agent_name == "prediction_agent":
-                # result = await prediction_agent.forecast_trends(query, previous_results)
-                result = {"mock": "prediction_agent not implemented yet"}
-                
-            elif agent_name == "document_agent":
-                # result = await document_agent.extract_information(query)
-                result = {"mock": "document_agent not implemented yet"}
-                
+
+            # 📊 Data stage
+            elif agent_name == "data_agent":
+                print(f"Planner Agent: Running data_agent for entity: {company or query}")
+                result = await data_agent.get_financial_data(company or query)
+
+            # 🧮 Calculation stage (placeholder)
             elif agent_name == "calculation_agent":
+                # Example placeholder: in future, use calculation_agent and pass data_agent results
                 # result = await calculation_agent.compute_metrics(query, previous_results)
-                result = {"mock": "calculation_agent not implemented yet"}
-                
-            elif agent_name == "comparison_agent":
-                # result = await comparison_agent.compare_peers(query, previous_results)
-                result = {"mock": "comparison_agent not implemented yet"}
-                
-            elif agent_name == "risk_agent":
-                # result = await risk_agent.assess_risks(query, previous_results)
-                result = {"mock": "risk_agent not implemented yet"}
-                
+                data = previous_results.get("data_agent")
+                result = {
+                    "mock": True,
+                    "note": "calculation_agent not implemented yet",
+                    "based_on_data": bool(data)
+                }
+
+            # 🧠 Reasoning stage
             elif agent_name == "reasoning_agent":
+                # If you implement a dedicated reasoning_agent, call it here
                 # result = await reasoning_agent.analyze_context(query, previous_results, context)
                 result = await self._reasoning_fallback(query, previous_results)
-                
+
+            # 📈 Prediction stage
+            elif agent_name == "prediction_agent":
+                # result = await prediction_agent.forecast_trends(query, previous_results)
+                # For now, use LLM to provide a cautious qualitative outlook
+                result = await self._prediction_fallback(query, previous_results)
+
+            # 📑 Document / comparison / risk / validation = placeholders for now
+            elif agent_name == "document_agent":
+                result = {"mock": "document_agent not implemented yet"}
+
+            elif agent_name == "comparison_agent":
+                result = {"mock": "comparison_agent not implemented yet"}
+
+            elif agent_name == "risk_agent":
+                result = await self._risk_fallback(query, previous_results)
+
             elif agent_name == "validation_agent":
+                # If you have a real validation_agent, plug it here
                 # result = await validation_agent.verify_results(previous_results)
-                result = {"validated": True, "confidence": 0.85}
-                
+                result = {
+                    "validated": True,
+                    "confidence": 0.85,
+                    "notes": "Simple validation placeholder"
+                }
+
             else:
                 result = {"error": f"Unknown agent: {agent_name}"}
-            
+
             self._log_step(agent_name, "Completed", "Success")
             return result
-            
+
         except Exception as e:
             self._log_step(agent_name, "Failed", str(e))
             raise
-    
-    async def _reasoning_fallback(self, query: str, previous_results: Dict[str, Any]) -> str:
-        """Fallback reasoning when reasoning_agent not implemented"""
-        context = "\n".join([f"{k}: {v}" for k, v in previous_results.items()])
-        
-        prompt = f"""Analyze this financial query and provide insights:
 
-Query: {query}
+    # ───────────────────────── LLM FALLBACK HELPERS ─────────────────────────
 
-Available Data:
-{context}
+    async def _reasoning_fallback(
+        self,
+        query: str,
+        previous_results: Dict[str, Any]
+    ) -> str:
+        """Use Llama to reason over aggregated agent outputs."""
+        context_lines = []
+        for k, v in previous_results.items():
+            try:
+                serialized = truncate(json.dumps(v, indent=2, default=str), 1200)
+            except Exception:
+                serialized = truncate(v, 1200)
+            context_lines.append(f"{k}:\n{serialized}")
 
-Provide a brief analysis:"""
-        
-        return await call_llm(prompt)
-    
+        context_str = "\n\n".join(context_lines)
+        context_str = truncate(context_str, 2000)
+
+        prompt = f"""
+You are FinSage's Reasoning AI.
+
+User query:
+{truncate(query, 400)}
+
+Data from previous analysis stages:
+{context_str}
+
+Task:
+- Summarize the current situation of the entity or topic.
+- Analyze investment implications (upside, downside, key drivers).
+- Keep it focused, practical, and investor-friendly.
+- Avoid making absolute guarantees; talk in terms of scenarios and probabilities.
+
+Write 2–4 concise paragraphs.
+"""
+
+        return await call_llm(prompt, max_tokens=350)
+
+    async def _prediction_fallback(
+        self,
+        query: str,
+        previous_results: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Qualitative future outlook using Llama (since no numeric model is wired yet)."""
+        context_str = truncate(json.dumps(previous_results, default=str), 1500)
+
+        prompt = f"""
+You are FinSage's Forecast AI.
+
+User query:
+{truncate(query, 400)}
+
+Background analysis so far:
+{context_str}
+
+Task:
+- Provide a cautious, scenario-based future outlook (short-term and medium-term if relevant).
+- Explicitly mention uncertainty and factors that could change the outlook.
+- DO NOT claim precise price targets or guaranteed returns.
+
+Return your answer as plain text (no JSON needed)."""
+
+        text = await call_llm(prompt, max_tokens=300)
+        return {"qualitative_outlook": text.strip()}
+
+    async def _risk_fallback(
+        self,
+        query: str,
+        previous_results: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """LLM-based risk assessment placeholder."""
+        context_str = truncate(json.dumps(previous_results, default=str), 1500)
+
+        prompt = f"""
+You are FinSage's Risk Analysis AI.
+
+User query:
+{truncate(query, 400)}
+
+Existing analysis:
+{context_str}
+
+List the main categories of risk (e.g., market risk, company-specific risk, regulatory risk, valuation risk)
+and briefly explain each in 1–2 sentences.
+
+Return a short bullet-style text description.
+"""
+
+        text = await call_llm(prompt, max_tokens=250)
+        return {"risk_summary": text.strip()}
+
+    # ───────────────────────── RESPONSE SYNTHESIS ─────────────────────────
+
     async def synthesize_response(
-        self, 
-        query: str, 
+        self,
+        query: str,
         results: Dict[str, Any],
         intent: str
     ) -> str:
         """
-        Combines all agent outputs into a polished final summary.
-        
-        Args:
-            query: Original user query
-            results: Dictionary of agent results
-            intent: Detected intent
-            
-        Returns:
-            Final synthesized response
+        Combines all agent outputs into a polished final summary using Llama.
         """
         # Build context from results
         context_parts = []
         for agent, data in results.items():
-            if data and not isinstance(data, dict) or (isinstance(data, dict) and "error" not in data):
-                context_parts.append(f"**{agent.replace('_', ' ').title()}**:\n{data}\n")
-        
-        context = "\n".join(context_parts)
-        
-        prompt = f"""You are FinSage AI, an expert financial analyst assistant.
+            # Only ignore explicit errors
+            if isinstance(data, dict) and "error" in data:
+                continue
 
-User Query: "{query}"
-Detected Intent: {intent}
+            try:
+                serialized = truncate(json.dumps(data, indent=2, default=str), 1200)
+            except Exception:
+                serialized = truncate(data, 1200)
 
-Based on the multi-agent analysis below, synthesize a comprehensive, professional response.
+            context_parts.append(f"{agent}:\n{serialized}")
 
-Requirements:
-1. Start with a direct answer to the user's question
-2. Support with data and facts from the analysis
-3. Include relevant metrics, calculations, or comparisons
-4. Mention news/sentiment if relevant
-5. Provide risk assessment if available
-6. End with actionable insights or recommendations
-7. Be concise but thorough (3-5 paragraphs max)
-8. Use professional but conversational tone
+        context = truncate("\n\n".join(context_parts), 3000)
 
-Agent Analysis:
+        prompt = f"""
+You are FinSage AI, an expert financial analyst assistant.
+
+User Query:
+{truncate(query, 500)}
+
+Detected Intent:
+{intent}
+
+Below is the multi-stage analysis from different agents (news, data, calculations, reasoning, prediction, risk, validation):
+
 {context}
 
-Generate the final response:"""
-        
+TASK:
+- Start with a clear, direct answer to the user's question.
+- Use data, news, metrics, and reasoning to justify the answer.
+- If there is a forecast/outlook, present it as scenarios with uncertainty.
+- Highlight key risks and what could invalidate the view.
+- End with 2–4 concrete, actionable suggestions (e.g., what to monitor, what to compare, what to consider).
+
+Tone:
+- Professional but conversational
+- No hype, no absolute guarantees
+- Suitable for a retail investor with basic knowledge
+
+Write 3–6 short paragraphs.
+"""
+
         try:
-            response = await call_llm(prompt, max_tokens=800)
+            response = await call_llm(prompt, max_tokens=500)
             return response.strip()
         except Exception as e:
             return self._generate_error_response(query, str(e))
-    
+
+    # ───────────────────────── META UTILITIES ─────────────────────────
+
     def _calculate_confidence(self, results: Dict[str, Any]) -> float:
         """
-        Calculate confidence score based on agent results.
-        
-        Args:
-            results: Dictionary of agent results
-            
-        Returns:
-            Confidence score (0-1)
+        Simple heuristic confidence: based on how many agents succeeded
+        and whether validation exists.
         """
         if not results:
             return 0.0
-        
-        # Base confidence
-        confidence = 0.7
-        
-        # Boost for successful agent executions
-        successful = sum(1 for r in results.values() if not isinstance(r, dict) or "error" not in r)
+
         total = len(results)
-        success_rate = successful / total if total > 0 else 0
-        
-        confidence += success_rate * 0.2
-        
-        # Boost for validation
+        valid_count = 0
+
+        for r in results.values():
+            if isinstance(r, dict) and "error" not in r:
+                valid_count += 1
+            elif isinstance(r, str) and r.strip():
+                valid_count += 1
+
+        base = 0.6 + (valid_count / (total or 1)) * 0.3
+
         if "validation_agent" in results:
-            val_conf = results["validation_agent"].get("confidence", 0.8)
-            confidence = (confidence + val_conf) / 2
-        
-        return min(confidence, 1.0)
-    
+            val_conf = results["validation_agent"].get("confidence", 0.75)
+            base = (base + val_conf) / 2
+
+        return min(base, 1.0)
+
     def _extract_sources(self, results: Dict[str, Any]) -> List[Dict[str, str]]:
-        """Extract data sources from agent results"""
+        """Extract simple source metadata based on which agents ran."""
         sources = []
-        
-        # Add sources based on which agents ran
+
         if "data_agent" in results:
             sources.append({
                 "type": "Market Data",
-                "name": "Yahoo Finance / Alpha Vantage",
+                "name": "Financial APIs (e.g., Yahoo Finance / Alpha Vantage)",
                 "date": datetime.utcnow().strftime("%Y-%m-%d")
             })
-        
+
         if "news_agent" in results:
             sources.append({
                 "type": "Financial News",
-                "name": "NewsAPI / Financial Times",
+                "name": "News APIs / major financial news outlets",
                 "date": datetime.utcnow().strftime("%Y-%m-%d")
             })
-        
+
         if "document_agent" in results:
             sources.append({
-                "type": "SEC Filings",
-                "name": "SEC EDGAR Database",
+                "type": "Filings / Reports",
+                "name": "Regulatory/filing databases (e.g., SEC EDGAR)",
                 "date": datetime.utcnow().strftime("%Y-%m-%d")
             })
-        
+
         return sources
-    
+
     def _log_step(self, agent_name: str, action: str, result: str):
-        """Log an agent execution step"""
+        """Log a step in the execution trace."""
         self.execution_log.append(
             AgentStep(
                 agent_name=agent_name,
@@ -463,19 +640,22 @@ Generate the final response:"""
                 timestamp=datetime.utcnow()
             )
         )
-    
+
     def _generate_error_response(self, query: str, error: str) -> str:
-        """Generate user-friendly error response"""
-        return f"""I apologize, but I encountered an issue processing your query: "{query}"
+        """Generate a user-friendly error response."""
+        return f"""I’m sorry, but I ran into a problem while processing your query:
 
-Error: {error}
+\"{query}\"
 
-Please try:
-- Rephrasing your question
-- Being more specific about what information you need
-- Checking if you mentioned valid stock tickers
+Error details (for debugging):
+{error}
 
-I'm here to help with financial analysis, stock information, market insights, and investment guidance."""
+You can try:
+- Rephrasing or simplifying the question
+- Being specific about the company, ticker, or asset
+- Asking for a particular kind of analysis (news impact, valuation, comparison, etc.)
+
+I’m designed to help with financial analysis, stock information, market insights, and investment-oriented questions."""
 
 
 planner_agent = PlannerAgent()

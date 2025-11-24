@@ -265,5 +265,4 @@ class DataAgent:
             }
 
 
-# ✅ Instance
 data_agent = DataAgent()
