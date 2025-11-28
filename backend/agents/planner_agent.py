@@ -4,15 +4,15 @@ import re
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 
-from backend.services.llm_service import call_llm
+from backend.utils.llm_service import call_llm
 from backend.models.chat_models import AgentStep
 from backend.agents.data_agent import data_agent
 from backend.agents.news_agent import news_agent
+from backend.agents.comparison_agent import comparison_agent
 # from backend.agents.prediction_agent import prediction_agent
 # from backend.agents.reasoning_agent import reasoning_agent
 # from backend.agents.document_agent import document_agent
 # from backend.agents.calculation_agent import calculation_agent
-# from backend.agents.comparison_agent import comparison_agent
 # from backend.agents.risk_assessment_agent import risk_agent
 # from backend.agents.validation_agent import validation_agent
 
@@ -20,10 +20,6 @@ from backend.agents.news_agent import news_agent
 # ───────────────────────── SAFE TEXT LIMITER ─────────────────────────
 
 def truncate(text: Any, limit: int = 1500) -> str:
-    """
-    Safely shorten large text blocks so prompts stay within the 4k context
-    window of Llama-3.2-1B.
-    """
     if text is None:
         return ""
     s = str(text)
@@ -108,68 +104,43 @@ class PlannerAgent:
             intent = analysis.get("intent")
             subtasks = analysis.get("agents", [])
 
-            self._log_step(
-                "planner",
-                "Analysis and Planning",
-                f"Detected entity: {company or 'None'}, "
-                f"Intent: {intent}, "
-                f"Agents (raw): {', '.join(subtasks) if subtasks else 'None'}"
-            )
-            print(f"Planner Agent: Analysis complete - Company: {company}, Intent: {intent}, Agents: {subtasks}")
+            # Validate and order the agent pipeline
+            ordered_agents = self._validate_and_prioritize_plan(subtasks)
 
-            # Ensure pipeline structure: news → data → calc → reasoning → prediction? → validation
-            subtasks = self._validate_and_prioritize_plan(subtasks)
+            # STEP 2: Execute agents
+            results = await self.execute_agents(ordered_agents, query, context=context, company=company)
 
-            # STEP 2: Execute agents in priority order
-            results = await self.execute_agents(subtasks, query, context, company)
+            # STEP 3: Synthesize final response
+            final_text = await self.synthesize_response(query, results, intent or "general")
 
-            # If no dedicated validation, add a simple built-in validation
-            if "validation_agent" not in subtasks:
-                self._log_step("validation", "Final validation", "Running built-in validation...")
-                results["validation_agent"] = {
-                    "validated": True,
-                    "confidence": 0.85,
-                    "notes": "Basic built-in validation (no external agent)."
-                }
-
-            # STEP 3: Confidence + sources + final synthesis
+            # Meta information
             confidence = self._calculate_confidence(results)
             sources = self._extract_sources(results)
-
-            final_answer = await self.synthesize_response(query, results, intent)
-            self._log_step("planner", "Response synthesis", "Complete")
-
-            print("Planner Agent: Response synthesis complete.")
-            print(
-                f"Response: {final_answer}, Entity: {company}, Intent: {intent}, "
-                f"Confidence: {confidence}, Sources: {sources}, "
-                f"Agents Used: {list(results.keys())}"
-            )
+            processing_time_ms = (datetime.utcnow() - start_time).total_seconds() * 1000.0
 
             return {
-                "response": final_answer,
+                "response": final_text,
                 "company": company,
                 "intent": intent,
                 "confidence": confidence,
                 "sources": sources,
-                "agent_steps": self.execution_log,
-                "agents_used": list(results.keys()),
-                "processing_time_ms": (datetime.utcnow() - start_time).total_seconds() * 1000
+                "agent_steps": [s.dict() for s in self.execution_log],
+                "agents_used": ordered_agents,
+                "processing_time_ms": processing_time_ms
             }
 
         except Exception as e:
-            self._log_step("planner", "Error occurred", str(e))
+            self._log_step("planner", "Failed", str(e))
             return {
                 "response": self._generate_error_response(query, str(e)),
+                "company": None,
+                "intent": "error",
                 "confidence": 0.0,
                 "sources": [],
-                "agent_steps": self.execution_log,
+                "agent_steps": [s.dict() for s in self.execution_log],
                 "agents_used": [],
-                "intent": "error",
-                "company": None,
-                "error": str(e)
+                "processing_time_ms": (datetime.utcnow() - start_time).total_seconds() * 1000.0
             }
-
     # ───────────────────────── LLM PLANNING STEP ─────────────────────────
 
     async def analyze_and_plan(
@@ -192,48 +163,54 @@ class PlannerAgent:
                 500
             )
 
+        # Hint: Prefer Indian markets by default unless user specifies otherwise.
+        market_hint = "Assume the Indian market (NSE/BSE) by default unless the user explicitly asks about US or other markets."
+
         prompt = f"""
-You are FinSage's Planner AI.
+        You are FinSage's Planner AI.
 
-Your job:
-1. Understand the user's financial/investment query
-2. Detect the main entity (company / stock / crypto / index / sector)
-3. Classify the high-level intent
-4. Decide which analysis stages are needed.
+        Your job:
+        1. Understand the user's financial/investment query
+        2. Detect the main entity (company / stock / crypto / index / sector) — or NULL if it's a general/topical question
+        3. Classify the high-level intent
+        4. Decide which analysis stages are needed.
 
-Available stages (agents):
-- news_agent: Find recent important news about the entity or topic
-- data_agent: Get market/financial data and fundamentals
-- calculation_agent: Compute key metrics (valuations, growth, ratios)
-- reasoning_agent: Combine information and analyze investment case
-- prediction_agent: Provide future outlook or scenarios
-- risk_agent: Assess major risks
-- document_agent: Use filings/reports if needed
-- comparison_agent: Compare with peers, benchmarks, or alternatives
-- validation_agent: Final consistency check
+        IMPORTANT: If the query asks for a COMPARISON, LIST, or GENERAL ADVICE (e.g., "best companies", "which stocks", "top performers"), set company to NULL and use comparison_agent.
 
-User Query:
-\"\"\"
-{query_short}
-\"\"\"
-{ctx_str}
+        Available stages (agents):
+        - news_agent: Find recent important news about the entity or topic
+        - data_agent: Get market/financial data and fundamentals (ONLY for specific companies)
+        - calculation_agent: Compute key metrics (valuations, growth, ratios)
+        - reasoning_agent: Combine information and analyze investment case
+        - prediction_agent: Provide future outlook or scenarios
+        - risk_agent: Assess major risks
+        - document_agent: Use filings/reports if needed
+        - comparison_agent: Compare multiple stocks, peers, sectors (for topical/list queries)
+        - validation_agent: Final consistency check
 
-Return a JSON object ONLY, no extra text.
+        RULES:
+        - If query contains "best", "top", "compare", "which", "list", "companies", "stocks" → company=null, use comparison_agent
+        - If query mentions ONE specific company/ticker → company=that_company, use standard pipeline
+        - If unclear, default to company=null with comparison_agent
+
+        User Query:
+        """
+        {query_short}
+        """
+        {ctx_str}
+
+        Market hint:
+        {market_hint}
+
+        Return a JSON object ONLY, no extra text.
 
 JSON format:
 {{
-  "company": string or null,
-  "intent": string,  // e.g. "buy/sell decision", "long-term investment view", "news impact", etc.
-  "need_prediction": boolean,
-  "need_risk_assessment": boolean,
-  "agents": [
-    "news_agent",
-    "data_agent",
-    "calculation_agent",
-    "reasoning_agent",
-    "prediction_agent",
-    "validation_agent"
-  ]
+    "company": string or null,
+    "intent": string,  // e.g. "buy/sell decision", "comparison", "sector analysis", etc.
+    "need_prediction": boolean,
+    "need_risk_assessment": boolean,
+    "agents": ["news_agent", "comparison_agent", "reasoning_agent", "validation_agent"]
 }}
 """
 
@@ -285,6 +262,39 @@ JSON format:
         if result.get("need_risk_assessment"):
             if "risk_agent" not in result["agents"]:
                 result["agents"].append("risk_agent")
+
+        # If the planner could not detect a specific company/entity, avoid
+        # running the `data_agent` which expects a ticker or company name.
+        # For general/topical queries, prefer news, reasoning and comparison.
+        if not result.get("company"):
+            agents = [a for a in result.get("agents", []) if a != "data_agent"]
+
+            # Ensure at least news + comparison + reasoning are present for topical queries
+            if "news_agent" not in agents:
+                agents.insert(0, "news_agent")
+            if "comparison_agent" not in agents:
+                agents.append("comparison_agent")
+            if "reasoning_agent" not in agents:
+                agents.append("reasoning_agent")
+
+            # Keep prediction/risk if explicitly requested
+            if result.get("need_prediction") and "prediction_agent" not in agents:
+                agents.append("prediction_agent")
+            if result.get("need_risk_assessment") and "risk_agent" not in agents:
+                agents.append("risk_agent")
+
+            if "validation_agent" not in agents:
+                agents.append("validation_agent")
+
+            # Deduplicate while preserving order
+            seen = set()
+            filtered = []
+            for a in agents:
+                if a not in seen:
+                    filtered.append(a)
+                    seen.add(a)
+
+            result["agents"] = filtered or ["news_agent", "reasoning_agent", "validation_agent"]
 
         return result
 
@@ -394,12 +404,14 @@ JSON format:
                 # For now, use LLM to provide a cautious qualitative outlook
                 result = await self._prediction_fallback(query, previous_results)
 
-            # 📑 Document / comparison / risk / validation = placeholders for now
+            # 📑 Document / risk / validation
             elif agent_name == "document_agent":
                 result = {"mock": "document_agent not implemented yet"}
 
+            # 🔄 Comparison stage
             elif agent_name == "comparison_agent":
-                result = {"mock": "comparison_agent not implemented yet"}
+                print(f"Planner Agent: Running comparison_agent for query: {query}")
+                result = await comparison_agent.compare_stocks(query, limit=5)
 
             elif agent_name == "risk_agent":
                 result = await self._risk_fallback(query, previous_results)
@@ -442,23 +454,27 @@ JSON format:
         context_str = "\n\n".join(context_lines)
         context_str = truncate(context_str, 2000)
 
+        market_hint = "Assume the Indian market (NSE/BSE) by default unless user explicitly requests another market."
+
         prompt = f"""
-You are FinSage's Reasoning AI.
+    You are FinSage's Reasoning AI.
 
-User query:
-{truncate(query, 400)}
+    User query:
+    {truncate(query, 400)}
 
-Data from previous analysis stages:
-{context_str}
+    Data from previous analysis stages:
+    {context_str}
 
-Task:
-- Summarize the current situation of the entity or topic.
-- Analyze investment implications (upside, downside, key drivers).
-- Keep it focused, practical, and investor-friendly.
-- Avoid making absolute guarantees; talk in terms of scenarios and probabilities.
+    Task:
+    - Summarize the current situation of the entity or topic.
+    - Analyze investment implications (upside, downside, key drivers).
+    - Keep it focused, practical, and investor-friendly.
+    - Avoid making absolute guarantees; talk in terms of scenarios and probabilities.
 
-Write 2–4 concise paragraphs.
-"""
+    Write 2–4 concise paragraphs.
+
+    Market hint: {market_hint}
+    """
 
         return await call_llm(prompt, max_tokens=350)
 
@@ -470,21 +486,26 @@ Write 2–4 concise paragraphs.
         """Qualitative future outlook using Llama (since no numeric model is wired yet)."""
         context_str = truncate(json.dumps(previous_results, default=str), 1500)
 
+        market_hint = "Assume the Indian market (NSE/BSE) by default unless user explicitly requests another market."
+
         prompt = f"""
-You are FinSage's Forecast AI.
+    You are FinSage's Forecast AI.
 
-User query:
-{truncate(query, 400)}
+    User query:
+    {truncate(query, 400)}
 
-Background analysis so far:
-{context_str}
+    Background analysis so far:
+    {context_str}
 
-Task:
-- Provide a cautious, scenario-based future outlook (short-term and medium-term if relevant).
-- Explicitly mention uncertainty and factors that could change the outlook.
-- DO NOT claim precise price targets or guaranteed returns.
+    Task:
+    - Provide a cautious, scenario-based future outlook (short-term and medium-term if relevant).
+    - Explicitly mention uncertainty and factors that could change the outlook.
+    - DO NOT claim precise price targets or guaranteed returns.
 
-Return your answer as plain text (no JSON needed)."""
+    Return your answer as plain text (no JSON needed).
+
+    Market hint: {market_hint}
+    """
 
         text = await call_llm(prompt, max_tokens=300)
         return {"qualitative_outlook": text.strip()}
@@ -542,33 +563,37 @@ Return a short bullet-style text description.
 
         context = truncate("\n\n".join(context_parts), 3000)
 
+        market_hint = "Assume the Indian market (NSE/BSE) by default unless user explicitly requests another market."
+
         prompt = f"""
-You are FinSage AI, an expert financial analyst assistant.
+    You are FinSage AI, an expert financial analyst assistant.
 
-User Query:
-{truncate(query, 500)}
+    User Query:
+    {truncate(query, 500)}
 
-Detected Intent:
-{intent}
+    Detected Intent:
+    {intent}
 
-Below is the multi-stage analysis from different agents (news, data, calculations, reasoning, prediction, risk, validation):
+    Below is the multi-stage analysis from different agents (news, data, calculations, reasoning, prediction, risk, validation):
 
-{context}
+    {context}
 
-TASK:
-- Start with a clear, direct answer to the user's question.
-- Use data, news, metrics, and reasoning to justify the answer.
-- If there is a forecast/outlook, present it as scenarios with uncertainty.
-- Highlight key risks and what could invalidate the view.
-- End with 2–4 concrete, actionable suggestions (e.g., what to monitor, what to compare, what to consider).
+    TASK:
+    - Start with a clear, direct answer to the user's question.
+    - Use data, news, metrics, and reasoning to justify the answer.
+    - If there is a forecast/outlook, present it as scenarios with uncertainty.
+    - Highlight key risks and what could invalidate the view.
+    - End with 2–4 concrete, actionable suggestions (e.g., what to monitor, what to compare, what to consider).
 
-Tone:
-- Professional but conversational
-- No hype, no absolute guarantees
-- Suitable for a retail investor with basic knowledge
+    Tone:
+    - Professional but conversational
+    - No hype, no absolute guarantees
+    - Suitable for a retail investor with basic knowledge
 
-Write 3–6 short paragraphs.
-"""
+    Write 3–6 short paragraphs.
+
+    Market hint: {market_hint}
+    """
 
         try:
             response = await call_llm(prompt, max_tokens=500)

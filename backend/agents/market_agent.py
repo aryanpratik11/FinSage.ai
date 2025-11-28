@@ -3,7 +3,7 @@
 Prediction Agent — uses ML models to predict financial trends or metrics.
 """
 
-from backend.services import prediction_service
+from backend.utils import prediction_service
 
 def handle_prediction_query(query: str):
     """

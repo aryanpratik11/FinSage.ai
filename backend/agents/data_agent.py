@@ -44,18 +44,40 @@ class DataAgent:
         Extracts a likely company name or ticker from a free-form query.
         Example: 'Should I invest in TCS?' -> 'TCS'
         """
-        ticker_match = re.search(r'\b[A-Z]{1,5}\b', text)
+        # If the query explicitly contains indicators of a generic/topical question,
+        # return empty to indicate "no specific company/ticker found".
+        generic_indicators = [
+            r"\bbest\b",
+            r"\btop\b",
+            r"\bwhich\b",
+            r"\bwho\b",
+            r"\bshould I\b",
+            r"\bwhat are\b",
+            r"\bbest companies\b",
+            r"\bbest stocks\b",
+            r"\binvest in\b",
+            r"\bto invest\b",
+        ]
+
+        lowered = text.lower() if text else ""
+        for pat in generic_indicators:
+            if re.search(pat, lowered):
+                return ""  # signal no specific company
+
+        # Detect explicit ticker-like uppercase tokens (e.g., TCS, INFY)
+        # Use word boundary to avoid single letters like "I"
+        ticker_match = re.search(r"\b([A-Z]{2,5})\b", text)
         if ticker_match:
-            return ticker_match.group(0)
+            return ticker_match.group(1)
 
         cleaned = re.sub(
-            r'(stock|share|invest|price|value|of|in|company|financials|should|the|today|about|performance)',
+            r'(stock|share|price|value|of|in|company|financials|the|today|about|performance|should)',
             '',
             text,
             flags=re.IGNORECASE
         ).strip()
 
-        return cleaned or text
+        return cleaned or ""
 
     # ---------------- DF CONVERTER ----------------
     def _convert_df_to_dict(self, df: pd.DataFrame) -> dict:
@@ -242,6 +264,19 @@ class DataAgent:
             print(f"DataAgent: Query/company received: '{query}'")
             company_or_ticker = self._extract_company_or_ticker(query)
             print(f"DataAgent: Extracted company/ticker: '{company_or_ticker}'")
+
+            # If no specific company/ticker detected, avoid treating the whole user
+            # query as a symbol. Return an empty/annotated result so planner can
+            # choose a different analysis path.
+            if not company_or_ticker:
+                return {
+                    "query": query,
+                    "symbol": None,
+                    "company_name": None,
+                    "summary": "No specific company or ticker detected in the query.",
+                    "note": "DataAgent skipped symbol resolution for a general/topic query.",
+                }
+
             data = await self.fetch_fundamentals(company_or_ticker)
 
             if data.get("company_name"):
